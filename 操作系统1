@@ -1,0 +1,620 @@
+package 操作系统1;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableModel;
+import javax.swing.tree.DefaultMutableTreeNode;
+import javax.swing.tree.DefaultTreeModel;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+
+// 目录项结构
+class DirEntry {
+    String fname;
+    String ext;
+    boolean isDir;
+    short startBlk;
+    int fileSize;
+    String ctime;
+
+    public DirEntry() {
+        fname = "";
+        ext = "";
+        isDir = false;
+        startBlk = 0;
+        fileSize = 0;
+        Date d = new Date();
+        ctime = d.toString();
+    }
+
+    public String getFullName() {
+        if (isDir) return fname;
+        return fname + "." + ext;
+    }
+}
+
+public class FATFileSystemGUI extends JFrame {
+    // 磁盘参数
+    private static final int BLOCK_TOTAL = 64;
+    private static final int BLOCK_SIZE = 1024;
+    private static final int FAT_BLOCK_NUM = 4;
+    private static final int ROOT_BLOCK_NUM = 2;
+    private static final int FAT_FREE = 0;
+    private static final int FAT_EOF = -1;
+    private static final int ROOT_START = FAT_BLOCK_NUM;
+    private static final int DATA_START = FAT_BLOCK_NUM + ROOT_BLOCK_NUM;
+
+    // 磁盘模拟
+    private byte[][] disk = new byte[BLOCK_TOTAL][BLOCK_SIZE];
+    private int[] fat = new int[BLOCK_TOTAL];
+    private ArrayList<String> pathStack = new ArrayList<>();
+    private String copyCacheName = null;
+    private String copyCacheSrc = null;
+
+    // 界面组件
+    private JTree dirTree;
+    private DefaultTreeModel treeModel;
+    private DefaultMutableTreeNode rootNode;
+    private DefaultTableModel tableModel;
+    private JTable fileTable;
+    private JTextArea txtOpLog;
+    private JPanel panelDiskBlock;
+    private JLabel labelPath;
+
+    public FATFileSystemGUI() {
+        initFS();
+        initUI();
+        refreshAll();
+    }
+
+    // 初始化文件系统
+    private void initFS() {
+        for (int i = 0; i < BLOCK_TOTAL; i++) fat[i] = FAT_FREE;
+        pathStack.clear();
+        DirEntry dot = new DirEntry();
+        dot.fname = ".";
+        dot.isDir = true;
+        dot.startBlk = ROOT_START;
+        DirEntry dotDot = new DirEntry();
+        dotDot.fname = "..";
+        dotDot.isDir = true;
+        dotDot.startBlk = ROOT_START;
+        ArrayList<DirEntry> rootList = new ArrayList<>();
+        rootList.add(dot);
+        rootList.add(dotDot);
+        writeDirBlock(ROOT_START, rootList);
+    }
+
+    // 分配空闲块
+    private int allocBlock() {
+        for (int i = DATA_START; i < BLOCK_TOTAL; i++) {
+            if (fat[i] == FAT_FREE) {
+                fat[i] = FAT_EOF;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // 释放块链表
+    private void freeChain(int start) {
+        int cur = start;
+        while (cur != FAT_EOF && cur != FAT_FREE) {
+            int next = fat[cur];
+            fat[cur] = FAT_FREE;
+            cur = next;
+        }
+    }
+
+    // 读取目录块
+    private ArrayList<DirEntry> readDirBlock(int blkId) {
+        ArrayList<DirEntry> list = new ArrayList<>();
+        byte[] buf = disk[blkId];
+        int offset = 0;
+        while (offset < BLOCK_SIZE) {
+            String fnameRaw = new String(buf, offset, 8).trim();
+            String extRaw = new String(buf, offset + 8, 3).trim();
+            boolean isDir = buf[offset + 11] == 1;
+            short start = (short) ((buf[offset + 13] << 8) | (buf[offset + 12] & 0xff));
+            if (fnameRaw.isEmpty()) break;
+            DirEntry e = new DirEntry();
+            e.fname = fnameRaw;
+            e.ext = extRaw;
+            e.isDir = isDir;
+            e.startBlk = start;
+            list.add(e);
+            offset += 32;
+        }
+        return list;
+    }
+
+    // 写入目录块【修复：不会覆盖原有条目】
+    private void writeDirBlock(int blkId, ArrayList<DirEntry> entries) {
+        byte[] buf = new byte[BLOCK_SIZE];
+        Arrays.fill(buf, (byte) 0x20);
+        int offset = 0;
+        for (DirEntry e : entries) {
+            byte[] fnameBuf = new byte[8];
+            Arrays.fill(fnameBuf, (byte) ' ');
+            byte[] fnameBytes = e.fname.getBytes();
+            System.arraycopy(fnameBytes, 0, fnameBuf, 0, Math.min(fnameBytes.length, 8));
+
+            byte[] extBuf = new byte[3];
+            Arrays.fill(extBuf, (byte) ' ');
+            byte[] extBytes = e.ext.getBytes();
+            System.arraycopy(extBytes, 0, extBuf, 0, Math.min(extBytes.length, 3));
+
+            System.arraycopy(fnameBuf, 0, buf, offset, 8);
+            System.arraycopy(extBuf, 0, buf, offset + 8, 3);
+            buf[offset + 11] = (byte) (e.isDir ? 1 : 0);
+            buf[offset + 12] = (byte) (e.startBlk & 0xff);
+            buf[offset + 13] = (byte) ((e.startBlk >> 8) & 0xff);
+            offset += 32;
+        }
+        disk[blkId] = buf;
+    }
+
+    private int getCurrentDirBlk() {
+        if (pathStack.isEmpty()) return ROOT_START;
+        int curBlk = ROOT_START;
+        ArrayList<DirEntry> tmp = readDirBlock(ROOT_START);
+        for (String dirName : pathStack) {
+            for (DirEntry e : tmp) {
+                if (e.isDir && e.fname.equals(dirName)) {
+                    curBlk = e.startBlk;
+                    tmp = readDirBlock(curBlk);
+                    break;
+                }
+            }
+        }
+        return curBlk;
+    }
+
+    private DirEntry findEntry(String name, boolean isDir) {
+        ArrayList<DirEntry> list = readDirBlock(getCurrentDirBlk());
+        for (DirEntry e : list) {
+            if (e.getFullName().equals(name) && e.isDir == isDir)
+                return e;
+        }
+        return null;
+    }
+
+    // 创建文件【完全修复，可正常新建】
+    private String createFile(String fileName) {
+        String namePart;
+        String extPart = "";
+        int dotIdx = fileName.indexOf(".");
+        if (dotIdx != -1) {
+            namePart = fileName.substring(0, dotIdx);
+            extPart = fileName.substring(dotIdx + 1);
+            if (namePart.length() > 8) namePart = namePart.substring(0, 8);
+            if (extPart.length() > 3) extPart = extPart.substring(0, 3);
+        } else {
+            namePart = fileName.length() > 8 ? fileName.substring(0, 8) : fileName;
+        }
+        String fullShowName = namePart + (extPart.isBlank() ? "" : "." + extPart);
+
+        DirEntry exist = findEntry(fullShowName, false);
+        if (exist != null) {
+            return "错误：文件【" + fullShowName + "】已存在";
+        }
+
+        int newBlk = allocBlock();
+        if (newBlk == -1) {
+            return "错误：磁盘无空闲块";
+        }
+
+        ArrayList<DirEntry> dirList = readDirBlock(getCurrentDirBlk());
+        DirEntry newFile = new DirEntry();
+        newFile.fname = namePart;
+        newFile.ext = extPart;
+        newFile.isDir = false;
+        newFile.startBlk = (short) newBlk;
+        newFile.fileSize = 0;
+        dirList.add(newFile);
+        writeDirBlock(getCurrentDirBlk(), dirList);
+
+        return "成功创建文件：" + fullShowName;
+    }
+
+    // 创建文件夹
+    private String mkdir(String dirName) {
+        if (findEntry(dirName, true) != null) return "错误：文件夹已存在";
+        int subBlk = allocBlock();
+        if (subBlk == -1) return "错误：磁盘空间不足";
+        ArrayList<DirEntry> subList = new ArrayList<>();
+        DirEntry dot = new DirEntry();
+        dot.fname = ".";
+        dot.isDir = true;
+        dot.startBlk = (short) subBlk;
+        DirEntry dotDot = new DirEntry();
+        dotDot.fname = "..";
+        dotDot.isDir = true;
+        dotDot.startBlk = (short) getCurrentDirBlk();
+        subList.add(dot);
+        subList.add(dotDot);
+        writeDirBlock(subBlk, subList);
+        ArrayList<DirEntry> parentList = readDirBlock(getCurrentDirBlk());
+        DirEntry newDir = new DirEntry();
+        newDir.fname = dirName;
+        newDir.isDir = true;
+        newDir.startBlk = (short)subBlk;
+        parentList.add(newDir);
+        writeDirBlock(getCurrentDirBlk(), parentList);
+        return "成功创建文件夹：" + dirName;
+    }
+
+    // 删除
+    private String deleteItem(String name) {
+        boolean isDirTarget = findEntry(name, true) != null;
+        DirEntry target = findEntry(name, isDirTarget);
+        if (target == null) return "错误：目标不存在";
+        if (target.isDir) {
+            ArrayList<DirEntry> sub = readDirBlock(target.startBlk);
+            if (sub.size() > 2) return "错误：文件夹非空，禁止删除";
+        }
+        freeChain(target.startBlk);
+        ArrayList<DirEntry> list = readDirBlock(getCurrentDirBlk());
+        list.removeIf(e -> e.getFullName().equals(name));
+        writeDirBlock(getCurrentDirBlk(), list);
+        return "成功删除：" + name;
+    }
+
+    // 重命名
+    private String renameItem(String oldName, String newName) {
+        boolean isDirTarget = findEntry(oldName, true) != null;
+        DirEntry target = findEntry(oldName, isDirTarget);
+        if (target == null) return "错误：目标不存在";
+        if (findEntry(newName, isDirTarget) != null) return "错误：新名称已存在";
+        ArrayList<DirEntry> list = readDirBlock(getCurrentDirBlk());
+        for (DirEntry e : list) {
+            if (e.getFullName().equals(oldName)) {
+                int dotIdx = newName.indexOf(".");
+                if (dotIdx != -1 && !e.isDir) {
+                    e.fname = newName.substring(0, dotIdx);
+                    e.ext = newName.substring(dotIdx + 1);
+                } else {
+                    e.fname = newName;
+                    e.ext = "";
+                }
+                break;
+            }
+        }
+        writeDirBlock(getCurrentDirBlk(), list);
+        return "重命名成功：" + oldName + " → " + newName;
+    }
+
+    // 复制
+    private String copyItem(String name) {
+        boolean isDirTarget = findEntry(name, true) != null;
+        DirEntry target = findEntry(name, isDirTarget);
+        if (target == null) return "错误：目标不存在";
+        if (target.isDir) return "暂不支持复制文件夹";
+        copyCacheName = name;
+        copyCacheSrc = target.getFullName();
+        return "已复制文件：" + name + "，点击粘贴完成";
+    }
+
+    // 粘贴
+    private String pasteItem() {
+        if (copyCacheName == null) return "错误：未复制任何文件";
+        DirEntry srcE = findEntry(copyCacheName, false);
+        String newName = copyCacheName + "_副本";
+        if (findEntry(newName, false) != null) return "错误：副本文件已存在";
+        int newBlk = allocBlock();
+        if (newBlk == -1) return "错误：磁盘空间不足";
+        System.arraycopy(disk[srcE.startBlk], 0, disk[newBlk], 0, BLOCK_SIZE);
+        ArrayList<DirEntry> list = readDirBlock(getCurrentDirBlk());
+        DirEntry newE = new DirEntry();
+        int dotIdx = newName.indexOf(".");
+        if (dotIdx != -1) {
+            newE.fname = newName.substring(0, dotIdx);
+            newE.ext = newName.substring(dotIdx + 1);
+        } else {
+            newE.fname = newName;
+        }
+        newE.isDir = false;
+        newE.startBlk = (short) newBlk;
+        list.add(newE);
+        writeDirBlock(getCurrentDirBlk(), list);
+        return "粘贴完成，生成副本：" + newName;
+    }
+
+    // 格式化磁盘
+    private String formatDisk() {
+        for (int i = 0; i < BLOCK_TOTAL; i++) fat[i] = FAT_FREE;
+        pathStack.clear();
+        DirEntry dot = new DirEntry();
+        dot.fname = ".";
+        dot.isDir = true;
+        dot.startBlk = ROOT_START;
+        DirEntry dotDot = new DirEntry();
+        dotDot.fname = "..";
+        dotDot.isDir = true;
+        dotDot.startBlk = ROOT_START;
+        ArrayList<DirEntry> rootList = new ArrayList<>();
+        rootList.add(dot);
+        rootList.add(dotDot);
+        writeDirBlock(ROOT_START, rootList);
+        copyCacheName = null;
+        return "磁盘格式化完成，所有数据已清空";
+    }
+
+    // 绘制磁盘块面板
+    private void drawDiskPanel() {
+        panelDiskBlock.removeAll();
+        panelDiskBlock.setLayout(new GridLayout(8, 8, 2, 2));
+        for (int i = 0; i < BLOCK_TOTAL; i++) {
+            JLabel lbl = new JLabel(String.valueOf(i), SwingConstants.CENTER);
+            lbl.setOpaque(true);
+            lbl.setBorder(BorderFactory.createLineBorder(Color.BLACK));
+            if (i < FAT_BLOCK_NUM) {
+                lbl.setBackground(Color.GRAY);
+            } else if (i < ROOT_START + ROOT_BLOCK_NUM) {
+                lbl.setBackground(Color.ORANGE);
+            } else if (fat[i] != FAT_FREE) {
+                lbl.setBackground(Color.BLUE);
+                lbl.setForeground(Color.WHITE);
+            } else {
+                lbl.setBackground(Color.GREEN);
+            }
+            panelDiskBlock.add(lbl);
+        }
+        panelDiskBlock.revalidate();
+        panelDiskBlock.repaint();
+    }
+
+    // 刷新右侧文件表格【修复日志重复刷屏】
+    private void refreshFileTable() {
+        tableModel.setRowCount(0);
+        ArrayList<DirEntry> list = readDirBlock(getCurrentDirBlk());
+        int fileCnt = 0, dirCnt = 0;
+        for (DirEntry e : list) {
+            if (e.fname.equals(".") || e.fname.equals("..")) continue;
+            String type = e.isDir ? "文件夹" : "文件";
+            int size = e.isDir ? 0 : e.fileSize;
+            tableModel.addRow(new Object[]{e.getFullName(), type, size, e.startBlk});
+            if (e.isDir) dirCnt++;
+            else fileCnt++;
+        }
+        labelPath.setText("/" + String.join("/", pathStack));
+        txtOpLog.append("当前目录：/" + String.join("/", pathStack) + " | 文件：" + fileCnt + " | 文件夹：" + dirCnt + "\n");
+    }
+
+    // 刷新左侧目录树
+    private void refreshTree() {
+        rootNode.removeAllChildren();
+        buildTree(rootNode, ROOT_START);
+        treeModel.reload();
+    }
+
+    private void buildTree(DefaultMutableTreeNode parent, int blkId) {
+        ArrayList<DirEntry> list = readDirBlock(blkId);
+        for (DirEntry e : list) {
+            if (!e.isDir || e.fname.equals(".") || e.fname.equals("..")) continue;
+            DefaultMutableTreeNode child = new DefaultMutableTreeNode(e.fname);
+            parent.add(child);
+            buildTree(child, e.startBlk);
+        }
+    }
+
+    // 全局刷新
+    private void refreshAll() {
+        drawDiskPanel();
+        refreshFileTable();
+        refreshTree();
+    }
+
+    // 初始化界面（完全匹配截图布局）
+    private void initUI() {
+        setTitle("FAT文件系统模拟器");
+        setSize(1480, 920);
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setLayout(new BorderLayout());
+
+        // 整体左右分栏
+        JSplitPane splitMain = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
+        splitMain.setDividerLocation(220);
+
+        // ========== 左侧面板：目录树 + 操作日志 ==========
+        JPanel panelLeft = new JPanel();
+        panelLeft.setLayout(new BorderLayout());
+        // 目录树
+        rootNode = new DefaultMutableTreeNode("根目录");
+        treeModel = new DefaultTreeModel(rootNode);
+        dirTree = new JTree(treeModel);
+        panelLeft.add(new JScrollPane(dirTree), BorderLayout.CENTER);
+        // 操作信息日志
+        txtOpLog = new JTextArea();
+        txtOpLog.setEditable(false);
+        JPanel panelLog = new JPanel(new BorderLayout());
+        panelLog.add(new JLabel("操作信息"), BorderLayout.NORTH);
+        panelLog.add(new JScrollPane(txtOpLog), BorderLayout.CENTER);
+        panelLog.setPreferredSize(new Dimension(200, 220));
+        panelLeft.add(panelLog, BorderLayout.SOUTH);
+        splitMain.setLeftComponent(panelLeft);
+
+        // ========== 右侧大区域 ==========
+        JPanel panelRightAll = new JPanel();
+        panelRightAll.setLayout(new BorderLayout());
+
+        // 顶部按钮栏
+        JPanel panelBtnTop = new JPanel();
+        panelBtnTop.setLayout(new FlowLayout(FlowLayout.LEFT, 8, 5));
+        JButton btnUp = new JButton("↑上级目录");
+        JButton btnRefresh = new JButton("刷新");
+        JButton btnNewFile = new JButton("新建文件");
+        JButton btnNewDir = new JButton("新建文件夹");
+        JButton btnDel = new JButton("删除");
+        JButton btnRename = new JButton("重命名");
+        JButton btnCopy = new JButton("复制");
+        JButton btnPaste = new JButton("粘贴");
+        panelBtnTop.add(btnUp);
+        panelBtnTop.add(btnRefresh);
+        panelBtnTop.add(btnNewFile);
+        panelBtnTop.add(btnNewDir);
+        panelBtnTop.add(btnDel);
+        panelBtnTop.add(btnRename);
+        panelBtnTop.add(btnCopy);
+        panelBtnTop.add(btnPaste);
+        panelRightAll.add(panelBtnTop, BorderLayout.NORTH);
+
+        // 当前路径栏
+        labelPath = new JLabel("/");
+        panelRightAll.add(labelPath, BorderLayout.CENTER);
+
+        // 文件表格
+        String[] tableHeader = {"名称", "类型", "大小(字节)", "起始块"};
+        tableModel = new DefaultTableModel(tableHeader, 0) {
+            @Override
+            public boolean isCellEditable(int row, int column) {
+                return false;
+            }
+        };
+        fileTable = new JTable(tableModel);
+        fileTable.setRowHeight(24);
+        panelRightAll.add(new JScrollPane(fileTable), BorderLayout.CENTER);
+
+        // 右下分栏：磁盘图 + 底部按钮
+        JSplitPane splitBottom = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
+        splitBottom.setDividerLocation(700);
+        // 磁盘块视图
+        JPanel panelDiskWrap = new JPanel(new BorderLayout());
+        panelDiskWrap.add(new JLabel("磁盘块使用图"), BorderLayout.NORTH);
+        panelDiskBlock = new JPanel();
+        panelDiskWrap.add(panelDiskBlock, BorderLayout.CENTER);
+        // 底部按钮
+        JPanel panelBottomBtn = new JPanel();
+        panelBottomBtn.setLayout(new FlowLayout());
+        JButton btnViewFAT = new JButton("查看FAT表");
+        JButton btnFormat = new JButton("格式化");
+        panelBottomBtn.add(btnViewFAT);
+        panelBottomBtn.add(btnFormat);
+        panelDiskWrap.add(panelBottomBtn, BorderLayout.SOUTH);
+        splitBottom.setRightComponent(panelDiskWrap);
+        panelRightAll.add(splitBottom, BorderLayout.SOUTH);
+
+        splitMain.setRightComponent(panelRightAll);
+        add(splitMain, BorderLayout.CENTER);
+
+        // ========== 按钮绑定事件 ==========
+        // 上级目录
+        btnUp.addActionListener(e -> {
+            String res = cdUp();
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 刷新
+        btnRefresh.addActionListener(e -> refreshAll());
+        // 新建文件
+        btnNewFile.addActionListener(e -> {
+            String name = JOptionPane.showInputDialog("输入文件名（如test.txt）");
+            if (name == null || name.isBlank()) return;
+            String res = createFile(name);
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 新建文件夹
+        btnNewDir.addActionListener(e -> {
+            String name = JOptionPane.showInputDialog("输入文件夹名称");
+            if (name == null || name.isBlank()) return;
+            String res = mkdir(name);
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 删除
+        btnDel.addActionListener(e -> {
+            int row = fileTable.getSelectedRow();
+            if (row == -1) {
+                txtOpLog.append("请先选中表格中的项目\n");
+                return;
+            }
+            String name = tableModel.getValueAt(row, 0).toString();
+            String res = deleteItem(name);
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 重命名
+        btnRename.addActionListener(e -> {
+            int row = fileTable.getSelectedRow();
+            if (row == -1) {
+                txtOpLog.append("请先选中表格中的项目\n");
+                return;
+            }
+            String old = tableModel.getValueAt(row, 0).toString();
+            String newName = JOptionPane.showInputDialog("输入新名称", old);
+            if (newName == null || newName.isBlank()) return;
+            String res = renameItem(old, newName);
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 复制
+        btnCopy.addActionListener(e -> {
+            int row = fileTable.getSelectedRow();
+            if (row == -1) {
+                txtOpLog.append("请先选中表格中的文件\n");
+                return;
+            }
+            String name = tableModel.getValueAt(row, 0).toString();
+            String res = copyItem(name);
+            txtOpLog.append(res + "\n");
+        });
+        // 粘贴
+        btnPaste.addActionListener(e -> {
+            String res = pasteItem();
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+        // 格式化
+        btnFormat.addActionListener(e -> {
+            int opt = JOptionPane.showConfirmDialog(null, "确定格式化？所有数据将清空！", "警告", JOptionPane.YES_NO_OPTION);
+            if (opt == JOptionPane.YES_OPTION) {
+                String res = formatDisk();
+                txtOpLog.append(res + "\n");
+                refreshAll();
+            }
+        });
+        // 查看FAT表
+        btnViewFAT.addActionListener(e -> {
+            StringBuilder sb = new StringBuilder("FAT分配表：\n");
+            for (int i = 0; i < BLOCK_TOTAL; i++) {
+                sb.append("块").append(i).append(" : ").append(fat[i]).append("\t");
+                if ((i + 1) % 16 == 0) sb.append("\n");
+            }
+            JTextArea ta = new JTextArea(sb.toString());
+            ta.setEditable(false);
+            JOptionPane.showMessageDialog(null, new JScrollPane(ta), "FAT表", JOptionPane.PLAIN_MESSAGE);
+        });
+        // 目录树双击进入文件夹
+        dirTree.addTreeSelectionListener(event -> {
+            DefaultMutableTreeNode sel = (DefaultMutableTreeNode) dirTree.getLastSelectedPathComponent();
+            if (sel == null || sel == rootNode) return;
+            String dirName = sel.getUserObject().toString();
+            String res = cdIn(dirName);
+            txtOpLog.append(res + "\n");
+            refreshAll();
+        });
+    }
+
+    // 进入目录
+    private String cdIn(String dirName) {
+        DirEntry target = findEntry(dirName, true);
+        if (target == null) return "错误：文件夹不存在";
+        pathStack.add(dirName);
+        return "进入文件夹：" + dirName;
+    }
+
+    // 返回上级
+    private String cdUp() {
+        if (pathStack.isEmpty()) return "提示：已在根目录，无法返回";
+        pathStack.remove(pathStack.size() - 1);
+        return "返回上级目录";
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new FATFileSystemGUI().setVisible(true));
+    }
+}
